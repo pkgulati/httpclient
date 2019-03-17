@@ -28,9 +28,11 @@ class HttpClient {
     char*   response;
     int     response_length;
     int     message_completed;
+    int     status_code;
+    int     error_code;
+    char    error_message[256];
     
     private :
-        int connect();
         int _send_receive(char* url);
         int fd;
         char*   request_headers;
@@ -46,6 +48,7 @@ class HttpClient {
         size_t  bufread;
         char* parsepos;
         size_t  capacity;
+        int socket_connect(char *host, in_port_t port);
 };
 
 #endif /* http_client_h */

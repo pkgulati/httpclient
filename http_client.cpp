@@ -35,33 +35,36 @@ struct request_data {
     size_t headerlen;
 };
 
-static int socket_connect(char *host, in_port_t port){
+int
+HttpClient::socket_connect(char *host, in_port_t port)
+{
     struct hostent *hp;
     struct sockaddr_in addr;
-    int on = 1, sock;
+    int on = 1;
     
     if((hp = gethostbyname(host)) == NULL){
-        printf("gethostbyname failed\n");
-        exit(1);
+        sprintf(error_message, "Could not get host from hostname, error [%d]\n", errno);
+        return -1;
     }
+   
     bcopy(hp->h_addr, &addr.sin_addr, hp->h_length);
     addr.sin_port = htons(port);
     addr.sin_family = AF_INET;
-    sock = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
+    fd = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
     //setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (const char *)&on, sizeof(int));
     
-    if(sock == -1){
-        perror("setsockopt");
-        exit(1);
+    if(fd == -1){
+        sprintf(error_message, "Could not create socket, error [%d]\n", errno);
+        return -1;
     }
     
-    printf("connecting...\n");
-    if(connect(sock, (struct sockaddr *)&addr, sizeof(struct sockaddr_in)) == -1){
-        perror("connect");
-        printf("could not connect\n");
-        sock = -1;
+    if(connect(fd, (struct sockaddr *)&addr, sizeof(struct sockaddr_in)) == -1) {
+        fd = -1;
+        sprintf(error_message, "Connection refused, error [%d]\n", errno);
+        return -1;
     }
-    return sock;
+    
+    return fd;
 }
 
 static int on_message_begin(http_parser* parser) {
@@ -141,11 +144,6 @@ static int setSocketBlocking(int fd) {
 }
 
 
-int HttpClient::connect() {
-    fd = socket_connect(hostname, portnum);
-    return fd;
-}
-
 int
 HttpClient::_send_receive(char* url) {
 
@@ -162,12 +160,11 @@ HttpClient::_send_receive(char* url) {
     
     http_parser_url_init(&u);
     int result = http_parser_parse_url(url, strlen(url), has_protocol, &u);
-    printf("url result %d\n", result);
     
     if ((u.field_set & (1 << UF_HOST))) {
         char temp[256];
-        if (u.field_data[UF_PORT].len > 255) {
-            printf("invalid host");
+        if (u.field_data[UF_HOST].len > 255) {
+            strcpy(error_message, "hostname too long");
             return -1;
         }
         strncpy(temp, url+u.field_data[UF_HOST].off, u.field_data[UF_HOST].len);
@@ -186,14 +183,14 @@ HttpClient::_send_receive(char* url) {
     }
     
     if (hostname[0] == 0) {
-        printf("host not set\n");
+        strcpy(error_message, "hostname not provided");
         return -1;
     }
     
     if ((u.field_set & (1 << UF_PORT))) {
         char temp[6];
         if (u.field_data[UF_PORT].len > 5) {
-            printf("invalid port");
+            strcpy(error_message, "portnumber too long");
             return -1;
         }
         strncpy(temp, url+u.field_data[UF_PORT].off, u.field_data[UF_PORT].len);
@@ -204,11 +201,9 @@ HttpClient::_send_receive(char* url) {
             }
         }
         portnum = newport;
-        printf("port %d\n", portnum);
     }
     
     if ((u.field_set & (1 << UF_PATH))) {
-        printf("path set\n");
         strncpy(path, url+u.field_data[UF_PATH].off, u.field_data[UF_PATH].len);
         path[u.field_data[UF_PATH].len] = NULL;
     }
@@ -231,7 +226,7 @@ HttpClient::_send_receive(char* url) {
             sprintf(req, "POST %s HTTP/1.1\r\nHost: %s\r\nContent-Length: %d\r\n\r\n", path, hostname, request_length);
         }
     } else {
-        printf("inalid method\n");
+        strcpy(error_message,"inalid method");
         return -1;
     }
     
@@ -242,7 +237,7 @@ RETRY_REQUEST:
     response_length = 0;
     
     if (fd == -1) {
-        connect();
+        socket_connect(hostname, portnum);
         setSocketBlocking(fd);
     }
     else {
@@ -255,16 +250,18 @@ RETRY_REQUEST:
         else if (peeked < 0) {
             int lasterror = errno;
             if (lasterror == EWOULDBLOCK) {
-                printf("would block means socket is alive\n");
+                // socket is alive
+            } else {
+                fd = -1;
             }
         }
         else {
-            printf("data present\n");
+            // socket is live and data is present
         }
+        
         if (fd == -1) {
-            connect();
+            socket_connect(hostname, portnum);
         } else {
-            printf("socket is alive\n");
             setSocketBlocking(fd);
         }
     }
@@ -286,9 +283,11 @@ RETRY_REQUEST:
          sb = send(fd, req, strlen(req), 0);
     } else {
         int flags = 0;
+        
 #ifdef __linux__
-        printf("linux\n");
         flags = flags & MSG_MORE;
+#elif __APPLE__
+        // flags = flags & MSG_MORE;
 #endif
         sb = send(fd, req, strlen(req), flags);
         if (sb > 0) {
@@ -298,7 +297,6 @@ RETRY_REQUEST:
         }
     }
     
-    printf("sent bytes %d\n", sb);
     if (sb <= 0) {
         printf("Could not send\n");
         return sb;
@@ -312,10 +310,8 @@ RETRY_REQUEST:
             capacity += 4096;
         };
         
-        printf("wait for response\n");
         int recived_now = recv(fd, bufstart+bufread, capacity-bufread, 0);
         if (recived_now < 0) {
-            printf("Error in receive %d %d\n", recived_now, errno);
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 continue;
             }
@@ -323,46 +319,42 @@ RETRY_REQUEST:
         }
         
         if (recived_now == 0) {
-            printf("connection closed? %d\n", errno);
             if (!retry_done) {
                 retry_done = 1;
-                printf("reconnect\n");
-                connect();
+                socket_connect(hostname, portnum);
                 goto RETRY_REQUEST;
             }
             return recived_now;
         }
         if (recived_now <= 0) {
-            printf("nothig to recieve\n");
             return recived_now;
         }
         bufread += recived_now;
-        printf("total read %d\n", bufread);
-        printf("received buffer [%*.*s]\n", bufread, bufread, bufstart);
+        // printf("total read %d\n", bufread);
+        // printf("received buffer [%*.*s]\n", bufread, bufread, bufstart);
         
         char* headerend = strstr(bufstart, "\r\n\r\n");
         if (!headerend) {
-            printf("wait more\n");
             continue;
         }
         
         int toparse = bufread - totalparsed;
-        printf("parse %d bytes\n", toparse);
         int nparsed = http_parser_execute(&parser, &settings, parsepos, toparse);
         if (nparsed != toparse) {
-            printf("parsed partial");
+            strcpy(error_message, "invalid http response");
             return -1;
         }
-        
+       
         parsepos = parsepos + toparse;
         totalparsed = totalparsed + toparse;
         if (data.completed) {
+            status_code = parser.status_code;
             response = data.body;
             response_length = data.bodylen;
             break;
         }
     }
-    return HTTP_STATUS_OK;
+    return status_code;
 }
 
 int
@@ -399,6 +391,7 @@ HttpClient::HttpClient() {
     response_length = 0;
     strcpy(hostname, "");
     portnum = 80;
+    status_code = -1;
 }
 
 
